@@ -65,57 +65,117 @@ func getRealJID(primary types.JID, alt types.JID) (realJID types.JID, lidJID typ
 
 func saveLIDForUser(userID string, phone string, lid string) {
 	if phone == "" || lid == "" {
+		log.Warn().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("❌ Tentativa de salvar LID com valores vazios - IGNORADO")
 		return
 	}
+	
+	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("🔄 Iniciando salvamento de LID...")
+	
 	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
 	jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+	log.Debug().Str("cacheKey", cacheKey).Msg("  ✅ LID salvo no cache de memória")
+	
 	userLIDMapsMutex.Lock()
 	if userLIDMaps[userID] == nil {
 		userLIDMaps[userID] = make(map[string]string)
+		log.Debug().Str("userID", userID).Msg("  📋 Criado novo map para usuário")
 	}
+	
+	// Verificar se já existe
+	if existingLID, exists := userLIDMaps[userID][phone]; exists {
+		if existingLID == lid {
+			log.Debug().Str("phone", phone).Str("lid", lid).Msg("  ℹ️  LID já existe com mesmo valor - não modificado")
+		} else {
+			log.Warn().Str("phone", phone).Str("oldLID", existingLID).Str("newLID", lid).Msg("  ⚠️  ATENÇÃO: LID mudou para este número!")
+		}
+	} else {
+		log.Info().Str("phone", phone).Str("lid", lid).Msg("  ✨ NOVO mapeamento LID criado")
+	}
+	
 	userLIDMaps[userID][phone] = lid
+	totalMappings := len(userLIDMaps[userID])
 	userLIDMapsMutex.Unlock()
+	
+	log.Info().Str("userID", userID).Int("totalMappings", totalMappings).Msg("  📊 Total de mapeamentos LID para este usuário")
+	
 	go func() {
 		filename := fmt.Sprintf("lid_mapping_%s.json", userID)
-		data, _ := json.MarshalIndent(userLIDMaps[userID], "", "  ")
-		os.WriteFile(filename, data, 0644)
+		log.Debug().Str("filename", filename).Msg("  💾 Salvando mapeamentos em arquivo JSON...")
+		
+		data, err := json.MarshalIndent(userLIDMaps[userID], "", "  ")
+		if err != nil {
+			log.Error().Err(err).Msg("  ❌ Erro ao serializar JSON")
+			return
+		}
+		
+		err = os.WriteFile(filename, data, 0644)
+		if err != nil {
+			log.Error().Err(err).Str("filename", filename).Msg("  ❌ Erro ao escrever arquivo")
+			return
+		}
+		
+		fileInfo, _ := os.Stat(filename)
+		log.Info().Str("filename", filename).Int64("size", fileInfo.Size()).Msg("  ✅ Arquivo JSON salvo com sucesso")
 	}()
-	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("LID mapped")
+	
+	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("✅ LID mapeado com sucesso!")
 }
 
 func resolveLIDForUser(userID string, lid string) (string, bool) {
 	if lid == "" {
 		return "", false
 	}
+	
+	log.Debug().Str("userID", userID).Str("lid", lid).Msg("🔍 Resolvendo LID para número de telefone...")
+	
 	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
 	if phone, found := jidLidCache.Get(cacheKey); found {
+		log.Debug().Str("lid", lid).Str("phone", phone.(string)).Msg("  ✅ LID encontrado no CACHE")
 		return phone.(string), true
 	}
+	
+	log.Debug().Str("lid", lid).Msg("  🔎 LID não está no cache, buscando no map...")
 	userLIDMapsMutex.RLock()
 	defer userLIDMapsMutex.RUnlock()
 	if userMap, exists := userLIDMaps[userID]; exists {
+		log.Debug().Str("userID", userID).Int("totalMappings", len(userMap)).Msg("  📋 Buscando em " + fmt.Sprintf("%d", len(userMap)) + " mapeamentos...")
 		for phone, mappedLID := range userMap {
 			if mappedLID == lid {
 				jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+				log.Info().Str("lid", lid).Str("phone", phone).Msg("  ✅ LID encontrado no MAP e salvo no cache!")
 				return phone, true
 			}
 		}
+		log.Warn().Str("lid", lid).Msg("  ⚠️  LID não encontrado no map")
+	} else {
+		log.Warn().Str("userID", userID).Msg("  ⚠️  Nenhum mapeamento existe para este usuário ainda")
 	}
 	return "", false
 }
 
 func loadLIDsForUser(userID string) {
 	filename := fmt.Sprintf("lid_mapping_%s.json", userID)
+	log.Info().Str("userID", userID).Str("filename", filename).Msg("📂 Carregando mapeamentos LID do arquivo...")
+	
 	data, err := os.ReadFile(filename)
 	if err != nil {
+		log.Warn().Err(err).Str("filename", filename).Msg("⚠️  Arquivo de mapeamento LID não encontrado (primeira execução?)")
 		return
 	}
+	
+	log.Debug().Str("filename", filename).Int("size", len(data)).Msg("  📄 Arquivo lido com sucesso")
 	userLIDMapsMutex.Lock()
 	defer userLIDMapsMutex.Unlock()
 	if userLIDMaps[userID] == nil {
 		userLIDMaps[userID] = make(map[string]string)
 	}
-	err = json.Unmarshal(data, &userLIDMaps[userID])
+	tempMap := make(map[string]string)
+	err = json.Unmarshal(data, &tempMap)
+	if err != nil {
+		log.Error().Err(err).Str("userID", userID).Msg("Failed to load LID mappings")
+		return
+	}
+	userLIDMaps[userID] = tempMap
 	if err != nil {
 		log.Error().Err(err).Str("userID", userID).Msg("Failed to load LID mappings")
 		return
@@ -123,8 +183,9 @@ func loadLIDsForUser(userID string) {
 	for phone, lid := range userLIDMaps[userID] {
 		cacheKey := fmt.Sprintf("%s:%s", userID, lid)
 		jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+		log.Debug().Str("phone", phone).Str("lid", lid).Msg("  🔗 Mapeamento carregado")
 	}
-	log.Info().Str("userID", userID).Int("count", len(userLIDMaps[userID])).Msg("LID mappings loaded")
+	log.Info().Str("userID", userID).Int("count", len(userLIDMaps[userID])).Msg("✅ Todos os mapeamentos LID carregados com sucesso!")
 }
 
 func resolveRealJID(userID string, jid types.JID, altJID types.JID) types.JID {
@@ -143,20 +204,32 @@ func resolveRealJID(userID string, jid types.JID, altJID types.JID) types.JID {
 }
 
 func identifyChatType(userID string, chatJID types.JID, senderJID types.JID, senderAlt types.JID) (bool, types.JID, types.JID) {
+	log.Debug().Str("userID", userID).Str("chatJID", chatJID.String()).Str("senderJID", senderJID.String()).Str("senderAlt", senderAlt.String()).Msg("🔍 Identificando tipo de chat...")
+	
 	isGroup := chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer || strings.Contains(chatJID.Server, "broadcast")
+	
 	if isGroup {
+		log.Debug().Str("chatJID", chatJID.String()).Msg("  👥 Chat identificado como GRUPO")
 		realChatJID := chatJID
 		senderReal, senderLID := getRealJID(senderJID, senderAlt)
 		if isLID(senderLID) {
+			log.Info().Str("senderReal", senderReal.User).Str("senderLID", senderLID.User).Msg("  🆔 LID detectado em GRUPO - salvando...")
 			saveLIDForUser(userID, senderReal.User, senderLID.User)
+		} else {
+			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não usa LID")
 		}
 		return true, realChatJID, senderReal
 	} else {
+		log.Debug().Str("chatJID", chatJID.String()).Msg("  👤 Chat identificado como INDIVIDUAL")
 		realChatJID := resolveRealJID(userID, chatJID, senderAlt)
 		senderReal, senderLID := getRealJID(senderJID, senderAlt)
 		if isLID(senderLID) {
+			log.Info().Str("senderReal", senderReal.User).Str("senderLID", senderLID.User).Msg("  🆔 LID detectado em INDIVIDUAL - salvando...")
 			saveLIDForUser(userID, senderReal.User, senderLID.User)
+		} else {
+			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não usa LID")
 		}
+		log.Debug().Str("realChatJID", realChatJID.String()).Str("senderReal", senderReal.String()).Msg("  ✅ Chat identificado")
 		return false, realChatJID, senderReal
 	}
 }
@@ -1393,7 +1466,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 			// Only save if there's meaningful content (including delete messages)
 			if textContent != "" || mediaLink != "" || (messageType != "text" && messageType != "reaction") || messageType == "delete" {
-				isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+				_, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
 				// Serializar evt para JSON
 				evtJSON, err := json.Marshal(evt)
 				if err != nil {
