@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -41,6 +42,123 @@ type MyClient struct {
 	subscriptions  []string
 	db             *sqlx.DB
 	s              *server
+}
+
+// ============================================================================
+// LID/JID MANAGEMENT - Sistema completo de resolução
+// ============================================================================
+
+var jidLidCache = cache.New(24*time.Hour, 1*time.Hour)
+var userLIDMaps = make(map[string]map[string]string)
+var userLIDMapsMutex sync.RWMutex
+
+func isLID(jid types.JID) bool {
+	return jid.Server == "lid"
+}
+
+func getRealJID(primary types.JID, alt types.JID) (realJID types.JID, lidJID types.JID) {
+	if isLID(primary) {
+		return alt, primary
+	}
+	return primary, alt
+}
+
+func saveLIDForUser(userID string, phone string, lid string) {
+	if phone == "" || lid == "" {
+		return
+	}
+	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
+	jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+	userLIDMapsMutex.Lock()
+	if userLIDMaps[userID] == nil {
+		userLIDMaps[userID] = make(map[string]string)
+	}
+	userLIDMaps[userID][phone] = lid
+	userLIDMapsMutex.Unlock()
+	go func() {
+		filename := fmt.Sprintf("lid_mapping_%s.json", userID)
+		data, _ := json.MarshalIndent(userLIDMaps[userID], "", "  ")
+		os.WriteFile(filename, data, 0644)
+	}()
+	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("LID mapped")
+}
+
+func resolveLIDForUser(userID string, lid string) (string, bool) {
+	if lid == "" {
+		return "", false
+	}
+	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
+	if phone, found := jidLidCache.Get(cacheKey); found {
+		return phone.(string), true
+	}
+	userLIDMapsMutex.RLock()
+	defer userLIDMapsMutex.RUnlock()
+	if userMap, exists := userLIDMaps[userID]; exists {
+		for phone, mappedLID := range userMap {
+			if mappedLID == lid {
+				jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+				return phone, true
+			}
+		}
+	}
+	return "", false
+}
+
+func loadLIDsForUser(userID string) {
+	filename := fmt.Sprintf("lid_mapping_%s.json", userID)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return
+	}
+	userLIDMapsMutex.Lock()
+	defer userLIDMapsMutex.Unlock()
+	if userLIDMaps[userID] == nil {
+		userLIDMaps[userID] = make(map[string]string)
+	}
+	err = json.Unmarshal(data, &userLIDMaps[userID])
+	if err != nil {
+		log.Error().Err(err).Str("userID", userID).Msg("Failed to load LID mappings")
+		return
+	}
+	for phone, lid := range userLIDMaps[userID] {
+		cacheKey := fmt.Sprintf("%s:%s", userID, lid)
+		jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+	}
+	log.Info().Str("userID", userID).Int("count", len(userLIDMaps[userID])).Msg("LID mappings loaded")
+}
+
+func resolveRealJID(userID string, jid types.JID, altJID types.JID) types.JID {
+	if !isLID(jid) {
+		return jid
+	}
+	if altJID.Server != "" && !isLID(altJID) {
+		saveLIDForUser(userID, altJID.User, jid.User)
+		return altJID
+	}
+	if phone, found := resolveLIDForUser(userID, jid.User); found {
+		return types.NewJID(phone, types.DefaultUserServer)
+	}
+	log.Warn().Str("userID", userID).Str("lid", jid.User).Msg("Could not resolve LID")
+	return types.NewJID(jid.User, types.DefaultUserServer)
+}
+
+func identifyChatType(userID string, chatJID types.JID, senderJID types.JID, senderAlt types.JID) (bool, types.JID, types.JID) {
+	isGroup := chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer || strings.Contains(chatJID.Server, "broadcast")
+	if isGroup {
+		realChatJID := chatJID
+		senderReal, senderLID := getRealJID(senderJID, senderAlt)
+		if isLID(senderLID) {
+			saveLIDForUser(userID, senderReal.User, senderLID.User)
+		}
+		return true, realChatJID, senderReal
+	} else {
+		realChatJID := resolveRealJID(userID, chatJID, senderAlt)
+		senderReal, senderLID := getRealJID(senderJID, senderAlt)
+		if isLID(senderLID) {
+			saveLIDForUser(userID, senderReal.User, senderLID.User)
+		}
+		return false, realChatJID, senderReal
+	}
 }
 
 func sendToGlobalWebHook(jsonData []byte, token string, userID string) {
@@ -647,6 +765,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	dowebhook := 0
 	path := ""
 
+	if _, exists := userLIDMaps[mycli.userID]; !exists {
+		loadLIDsForUser(mycli.userID)
+	}
+
 	switch evt := rawEvt.(type) {
 	case *events.AppStateSyncComplete:
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
@@ -773,9 +895,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					if isGroup {
+						contactJID = realChatJID.String()
 					}
 
 					// Process S3 upload
@@ -861,9 +983,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					if isGroup {
+						contactJID = realChatJID.String()
 					}
 
 					// Process S3 upload
@@ -954,9 +1076,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					if isGroup {
+						contactJID = realChatJID.String()
 					}
 
 					// Process S3 upload
@@ -1036,9 +1158,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					if isGroup {
+						contactJID = realChatJID.String()
 					}
 
 					// Process S3 upload
@@ -1117,9 +1239,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				// if using S3 (same stream as other media)
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					if isGroup {
+						contactJID = realChatJID.String()
 					}
 					s3Data, err := GetS3Manager().ProcessMediaForS3(
 						context.Background(),
@@ -1271,6 +1393,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 			// Only save if there's meaningful content (including delete messages)
 			if textContent != "" || mediaLink != "" || (messageType != "text" && messageType != "reaction") || messageType == "delete" {
+				isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
 				// Serializar evt para JSON
 				evtJSON, err := json.Marshal(evt)
 				if err != nil {
@@ -1280,8 +1403,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 				err = mycli.s.saveMessageToHistory(
 					mycli.userID,
-					evt.Info.Chat.String(),
-					evt.Info.Sender.String(),
+					realChatJID.User,
+					realSenderJID.User,
 					evt.Info.ID,
 					messageType,
 					textContent,
@@ -1292,7 +1415,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save message to history")
 				} else {
-					err = mycli.s.trimMessageHistory(mycli.userID, evt.Info.Chat.String(), historyLimit)
+					err = mycli.s.trimMessageHistory(mycli.userID, realChatJID.User, historyLimit)
 					if err != nil {
 						log.Error().Err(err).Msg("Failed to trim message history")
 					}
@@ -1305,6 +1428,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Receipt:
 		postmap["type"] = "ReadReceipt"
 		dowebhook = 1
+		if isLID(evt.Chat) {
+			log.Debug().Str("userID", mycli.userID).Str("lid", evt.Chat.User).Msg("LID detected in receipt")
+		}
 		//if evt.Type == events.ReceiptTypeRead || evt.Type == events.ReceiptTypeReadSelf {
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
 			log.Info().Strs("id", evt.MessageIDs).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message was read")
