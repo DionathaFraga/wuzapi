@@ -1443,9 +1443,18 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Receipt:
 		postmap["type"] = "ReadReceipt"
 		dowebhook = 1
+		
+		// CORREÇÃO: Resolver LID para JID em receipts
+		realChatJID := evt.Chat
 		if isLID(evt.Chat) {
-			log.Debug().Str("userID", mycli.userID).Str("lid", evt.Chat.User).Msg("LID detected in receipt")
+			log.Debug().Str("userID", mycli.userID).Str("lid", evt.Chat.User).Msg("LID detected in receipt, resolving...")
+			realChatJID = resolveRealJID(mycli, evt.Chat, types.EmptyJID)
 		}
+		
+		// Adicionar JID real ao postmap
+		postmap["chatJID"] = realChatJID.String()
+		postmap["chatJIDUser"] = realChatJID.User
+		
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
 			log.Info().Strs("id", evt.MessageIDs).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message was read")
 			if evt.Type == types.ReceiptTypeRead {
@@ -1462,16 +1471,28 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Presence:
 		postmap["type"] = "Presence"
 		dowebhook = 1
+		
+		// CORREÇÃO: Resolver LID para JID em presence
+		realFromJID := evt.From
+		if isLID(evt.From) {
+			log.Debug().Str("userID", mycli.userID).Str("lid", evt.From.User).Msg("LID detected in presence, resolving...")
+			realFromJID = resolveRealJID(mycli, evt.From, types.EmptyJID)
+		}
+		
+		// Adicionar JID real ao postmap
+		postmap["fromJID"] = realFromJID.String()
+		postmap["fromJIDUser"] = realFromJID.User
+		
 		if evt.Unavailable {
 			postmap["state"] = "offline"
 			if evt.LastSeen.IsZero() {
-				log.Info().Str("from", evt.From.String()).Msg("User is now offline")
+				log.Info().Str("from", realFromJID.String()).Msg("User is now offline")
 			} else {
-				log.Info().Str("from", evt.From.String()).Str("lastSeen", fmt.Sprintf("%v", evt.LastSeen)).Msg("User is now offline")
+				log.Info().Str("from", realFromJID.String()).Str("lastSeen", fmt.Sprintf("%v", evt.LastSeen)).Msg("User is now offline")
 			}
 		} else {
 			postmap["state"] = "online"
-			log.Info().Str("from", evt.From.String()).Msg("User is now online")
+			log.Info().Str("from", realFromJID.String()).Msg("User is now online")
 		}
 	case *events.HistorySync:
 		postmap["type"] = "HistorySync"
@@ -1497,7 +1518,18 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.ChatPresence:
 		postmap["type"] = "ChatPresence"
 		dowebhook = 1
-		log.Info().Str("state", fmt.Sprintf("%s", evt.State)).Str("media", fmt.Sprintf("%s", evt.Media)).Str("chat", evt.MessageSource.Chat.String()).Str("sender", evt.MessageSource.Sender.String()).Msg("Chat Presence received")
+		
+		// CORREÇÃO: Resolver LID para JID em chat presence
+		isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.MessageSource.Chat, evt.MessageSource.Sender, types.EmptyJID)
+		
+		// Adicionar JIDs reais ao postmap
+		postmap["chatJID"] = realChatJID.String()
+		postmap["senderJID"] = realSenderJID.String()
+		postmap["chatJIDUser"] = realChatJID.User
+		postmap["senderJIDUser"] = realSenderJID.User
+		postmap["isGroup"] = isGroup
+		
+		log.Info().Str("state", fmt.Sprintf("%s", evt.State)).Str("media", fmt.Sprintf("%s", evt.Media)).Str("chat", realChatJID.String()).Str("sender", realSenderJID.String()).Msg("Chat Presence received")
 	case *events.CallOffer:
 		postmap["type"] = "CallOffer"
 		dowebhook = 1
@@ -1617,7 +1649,38 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.FBMessage:
 		postmap["type"] = "FBMessage"
 		dowebhook = 1
-		log.Info().Str("info", evt.Info.SourceString()).Msg("Facebook message received")
+		
+		// CORREÇÃO: Resolver LID para JID nas mensagens do Facebook/Instagram
+		isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+		
+		// Salvar o mapeamento LID se disponível
+		if isLID(evt.Info.Sender) && evt.Info.SenderAlt.Server != "" && !isLID(evt.Info.SenderAlt) {
+			saveLIDForUser(mycli, evt.Info.SenderAlt.User, evt.Info.Sender.User)
+			log.Info().
+				Str("lid", evt.Info.Sender.User).
+				Str("real_jid", evt.Info.SenderAlt.User).
+				Msg("✅ LID do Facebook/Instagram mapeado")
+		}
+		
+		// Usar o JID real no postmap
+		if isGroup {
+			postmap["chatJID"] = realChatJID.String()
+			postmap["senderJID"] = realSenderJID.String()
+			postmap["chatJIDUser"] = realChatJID.User
+			postmap["senderJIDUser"] = realSenderJID.User
+		} else {
+			postmap["chatJID"] = realSenderJID.String()
+			postmap["senderJID"] = realSenderJID.String()
+			postmap["chatJIDUser"] = realSenderJID.User
+			postmap["senderJIDUser"] = realSenderJID.User
+		}
+		
+		log.Info().
+			Str("info", evt.Info.SourceString()).
+			Str("realChatJID", realChatJID.User).
+			Str("realSenderJID", realSenderJID.User).
+			Bool("isGroup", isGroup).
+			Msg("📱 Mensagem do Facebook/Instagram recebida (LID resolvido)")
 	default:
 		log.Warn().Str("event", fmt.Sprintf("%+v", evt)).Msg("Unhandled event")
 	}
