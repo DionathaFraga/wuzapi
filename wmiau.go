@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -45,12 +46,20 @@ type MyClient struct {
 }
 
 // ============================================================================
-// LID/JID MANAGEMENT - Sistema completo de resolução
+// LID/JID MANAGEMENT - Sistema completo com PostgreSQL
 // ============================================================================
 
+// Estrutura para mapear a tabela whatsmeow_lid_map
+type LIDMapping struct {
+	JID       string    `db:"jid"`
+	LID       string    `db:"lid"`
+	PN        string    `db:"pn"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
 var jidLidCache = cache.New(24*time.Hour, 1*time.Hour)
-var userLIDMaps = make(map[string]map[string]string)
-var userLIDMapsMutex sync.RWMutex
+var lidCacheMutex sync.RWMutex
 
 func isLID(jid types.JID) bool {
 	return jid.Server == "lid"
@@ -63,176 +72,222 @@ func getRealJID(primary types.JID, alt types.JID) (realJID types.JID, lidJID typ
 	return primary, alt
 }
 
-func saveLIDForUser(userID string, phone string, lid string) {
-	if phone == "" || lid == "" {
-		log.Warn().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("❌ Tentativa de salvar LID com valores vazios - IGNORADO")
-		return
+// Salva LID no banco de dados PostgreSQL
+func saveLIDToDB(db *sqlx.DB, jid string, lid string, pn string) error {
+	if db == nil {
+		log.Error().Msg("❌ Database connection is nil")
+		return errors.New("database connection is nil")
 	}
-	
-	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("🔄 Iniciando salvamento de LID...")
-	
-	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
-	jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
-	log.Debug().Str("cacheKey", cacheKey).Msg("  ✅ LID salvo no cache de memória")
-	
-	userLIDMapsMutex.Lock()
-	if userLIDMaps[userID] == nil {
-		userLIDMaps[userID] = make(map[string]string)
-		log.Debug().Str("userID", userID).Msg("  📋 Criado novo map para usuário")
+
+	if jid == "" || lid == "" || pn == "" {
+		log.Warn().Str("jid", jid).Str("lid", lid).Str("pn", pn).Msg("❌ Valores vazios")
+		return errors.New("valores vazios não permitidos")
 	}
-	
-	// Verificar se já existe
-	if existingLID, exists := userLIDMaps[userID][phone]; exists {
-		if existingLID == lid {
-			log.Debug().Str("phone", phone).Str("lid", lid).Msg("  ℹ️  LID já existe com mesmo valor - não modificado")
-		} else {
-			log.Warn().Str("phone", phone).Str("oldLID", existingLID).Str("newLID", lid).Msg("  ⚠️  ATENÇÃO: LID mudou para este número!")
-		}
-	} else {
-		log.Info().Str("phone", phone).Str("lid", lid).Msg("  ✨ NOVO mapeamento LID criado")
+
+	query := `
+		INSERT INTO public.whatsmeow_lid_map (jid, lid, pn, created_at, updated_at)
+		VALUES ($1, $2, $3, NOW(), NOW())
+		ON CONFLICT (jid) 
+		DO UPDATE SET 
+			lid = EXCLUDED.lid,
+			pn = EXCLUDED.pn,
+			updated_at = NOW()
+	`
+
+	_, err := db.Exec(query, jid, lid, pn)
+	if err != nil {
+		log.Error().Err(err).Str("jid", jid).Str("lid", lid).Msg("❌ Erro ao salvar LID")
+		return err
 	}
-	
-	userLIDMaps[userID][phone] = lid
-	totalMappings := len(userLIDMaps[userID])
-	userLIDMapsMutex.Unlock()
-	
-	log.Info().Str("userID", userID).Int("totalMappings", totalMappings).Msg("  📊 Total de mapeamentos LID para este usuário")
-	
-	go func() {
-		filename := fmt.Sprintf("lid_mapping_%s.json", userID)
-		log.Debug().Str("filename", filename).Msg("  💾 Salvando mapeamentos em arquivo JSON...")
-		
-		data, err := json.MarshalIndent(userLIDMaps[userID], "", "  ")
-		if err != nil {
-			log.Error().Err(err).Msg("  ❌ Erro ao serializar JSON")
-			return
-		}
-		
-		err = os.WriteFile(filename, data, 0644)
-		if err != nil {
-			log.Error().Err(err).Str("filename", filename).Msg("  ❌ Erro ao escrever arquivo")
-			return
-		}
-		
-		fileInfo, _ := os.Stat(filename)
-		log.Info().Str("filename", filename).Int64("size", fileInfo.Size()).Msg("  ✅ Arquivo JSON salvo com sucesso")
-	}()
-	
-	log.Info().Str("userID", userID).Str("phone", phone).Str("lid", lid).Msg("✅ LID mapeado com sucesso!")
+
+	log.Debug().Str("jid", jid).Str("lid", lid).Str("pn", pn).Msg("✅ LID salvo no banco")
+	return nil
 }
 
-func resolveLIDForUser(userID string, lid string) (string, bool) {
+// Salva LID usando MyClient (versão completa com banco)
+func saveLIDForUser(mycli *MyClient, phone string, lid string) {
+	if phone == "" || lid == "" {
+		log.Warn().Str("userID", mycli.userID).Str("phone", phone).Str("lid", lid).Msg("❌ Valores inválidos")
+		return
+	}
+
+	jid := fmt.Sprintf("%s@%s", phone, types.DefaultUserServer)
+	
+	log.Info().Str("userID", mycli.userID).Str("phone", phone).Str("lid", lid).Msg("🔄 Processando LID...")
+
+	// 1. Salvar no cache
+	cacheKey := fmt.Sprintf("%s:%s", mycli.userID, lid)
+	lidCacheMutex.Lock()
+	jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
+	lidCacheMutex.Unlock()
+	log.Debug().Str("cacheKey", cacheKey).Msg("  ✅ Cache atualizado")
+
+	// 2. Salvar no PostgreSQL
+	err := saveLIDToDB(mycli.db, jid, lid, phone)
+	if err != nil {
+		log.Error().Err(err).Msg("  ❌ Falha ao salvar no banco")
+		return
+	}
+
+	log.Info().Str("userID", mycli.userID).Str("phone", phone).Str("lid", lid).Msg("✅ LID mapeado e persistido!")
+}
+
+// Resolve LID para número usando cache + PostgreSQL
+func resolveLIDForUser(mycli *MyClient, lid string) (string, bool) {
 	if lid == "" {
 		return "", false
 	}
-	
-	log.Debug().Str("userID", userID).Str("lid", lid).Msg("🔍 Resolvendo LID para número de telefone...")
-	
-	cacheKey := fmt.Sprintf("%s:%s", userID, lid)
+
+	log.Debug().Str("userID", mycli.userID).Str("lid", lid).Msg("🔍 Resolvendo LID...")
+
+	// 1. Verificar cache
+	cacheKey := fmt.Sprintf("%s:%s", mycli.userID, lid)
+	lidCacheMutex.RLock()
 	if phone, found := jidLidCache.Get(cacheKey); found {
-		log.Debug().Str("lid", lid).Str("phone", phone.(string)).Msg("  ✅ LID encontrado no CACHE")
-		return phone.(string), true
+		lidCacheMutex.RUnlock()
+		phoneStr := phone.(string)
+		log.Debug().Str("lid", lid).Str("phone", phoneStr).Msg("  ✅ CACHE HIT")
+		return phoneStr, true
 	}
+	lidCacheMutex.RUnlock()
+
+	// 2. Buscar no PostgreSQL
+	log.Debug().Str("lid", lid).Msg("  🔎 Buscando no banco...")
 	
-	log.Debug().Str("lid", lid).Msg("  🔎 LID não está no cache, buscando no map...")
-	userLIDMapsMutex.RLock()
-	defer userLIDMapsMutex.RUnlock()
-	if userMap, exists := userLIDMaps[userID]; exists {
-		log.Debug().Str("userID", userID).Int("totalMappings", len(userMap)).Msg("  📋 Buscando em " + fmt.Sprintf("%d", len(userMap)) + " mapeamentos...")
-		for phone, mappedLID := range userMap {
-			if mappedLID == lid {
-				jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
-				log.Info().Str("lid", lid).Str("phone", phone).Msg("  ✅ LID encontrado no MAP e salvo no cache!")
-				return phone, true
-			}
+	var mapping LIDMapping
+	query := `SELECT jid, lid, pn FROM public.whatsmeow_lid_map WHERE lid = $1 LIMIT 1`
+	
+	err := mycli.db.Get(&mapping, query, lid)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Warn().Str("lid", lid).Msg("  ⚠️  LID não encontrado")
+		} else {
+			log.Error().Err(err).Str("lid", lid).Msg("  ❌ Erro no banco")
 		}
-		log.Warn().Str("lid", lid).Msg("  ⚠️  LID não encontrado no map")
-	} else {
-		log.Warn().Str("userID", userID).Msg("  ⚠️  Nenhum mapeamento existe para este usuário ainda")
+		return "", false
 	}
-	return "", false
+
+	log.Info().Str("lid", lid).Str("pn", mapping.PN).Msg("  ✅ BANCO DE DADOS")
+
+	// 3. Atualizar cache
+	lidCacheMutex.Lock()
+	jidLidCache.Set(cacheKey, mapping.PN, cache.DefaultExpiration)
+	lidCacheMutex.Unlock()
+	log.Debug().Str("lid", lid).Msg("  💾 Cache atualizado")
+
+	return mapping.PN, true
 }
 
-func loadLIDsForUser(userID string) {
-	filename := fmt.Sprintf("lid_mapping_%s.json", userID)
-	log.Info().Str("userID", userID).Str("filename", filename).Msg("📂 Carregando mapeamentos LID do arquivo...")
+// Carrega todos LIDs do banco para o cache
+func loadLIDsForUser(mycli *MyClient) {
+	log.Info().Str("userID", mycli.userID).Msg("📂 Carregando LIDs do banco...")
+
+	var mappings []LIDMapping
+	query := `SELECT jid, lid, pn, created_at, updated_at FROM public.whatsmeow_lid_map ORDER BY updated_at DESC`
 	
-	data, err := os.ReadFile(filename)
+	err := mycli.db.Select(&mappings, query)
 	if err != nil {
-		log.Warn().Err(err).Str("filename", filename).Msg("⚠️  Arquivo de mapeamento LID não encontrado (primeira execução?)")
+		log.Error().Err(err).Msg("❌ Erro ao carregar LIDs")
 		return
 	}
-	
-	log.Debug().Str("filename", filename).Int("size", len(data)).Msg("  📄 Arquivo lido com sucesso")
-	userLIDMapsMutex.Lock()
-	defer userLIDMapsMutex.Unlock()
-	if userLIDMaps[userID] == nil {
-		userLIDMaps[userID] = make(map[string]string)
-	}
-	tempMap := make(map[string]string)
-	err = json.Unmarshal(data, &tempMap)
-	if err != nil {
-		log.Error().Err(err).Str("userID", userID).Msg("Failed to load LID mappings")
+
+	if len(mappings) == 0 {
+		log.Info().Msg("ℹ️  Nenhum LID no banco (primeira execução)")
 		return
 	}
-	userLIDMaps[userID] = tempMap
-	if err != nil {
-		log.Error().Err(err).Str("userID", userID).Msg("Failed to load LID mappings")
-		return
+
+	// Carregar todos no cache
+	lidCacheMutex.Lock()
+	for _, mapping := range mappings {
+		cacheKey := fmt.Sprintf("%s:%s", mycli.userID, mapping.LID)
+		jidLidCache.Set(cacheKey, mapping.PN, cache.DefaultExpiration)
+		log.Debug().Str("pn", mapping.PN).Str("lid", mapping.LID).Msg("  🔗 Mapeamento carregado")
 	}
-	for phone, lid := range userLIDMaps[userID] {
-		cacheKey := fmt.Sprintf("%s:%s", userID, lid)
-		jidLidCache.Set(cacheKey, phone, cache.DefaultExpiration)
-		log.Debug().Str("phone", phone).Str("lid", lid).Msg("  🔗 Mapeamento carregado")
-	}
-	log.Info().Str("userID", userID).Int("count", len(userLIDMaps[userID])).Msg("✅ Todos os mapeamentos LID carregados com sucesso!")
+	lidCacheMutex.Unlock()
+
+	log.Info().Str("userID", mycli.userID).Int("count", len(mappings)).Msg("✅ LIDs carregados do banco!")
 }
 
-func resolveRealJID(userID string, jid types.JID, altJID types.JID) types.JID {
+// Resolve o JID real a partir de LID
+func resolveRealJID(mycli *MyClient, jid types.JID, altJID types.JID) types.JID {
 	if !isLID(jid) {
 		return jid
 	}
+
+	log.Debug().Str("jid_user", jid.User).Str("jid_server", jid.Server).Msg("🔄 Resolvendo JID real de LID...")
+
 	if altJID.Server != "" && !isLID(altJID) {
-		saveLIDForUser(userID, altJID.User, jid.User)
+		saveLIDForUser(mycli, altJID.User, jid.User)
+		log.Info().Str("real_jid", altJID.User).Str("lid", jid.User).Msg("  ✅ Usando altJID")
 		return altJID
 	}
-	if phone, found := resolveLIDForUser(userID, jid.User); found {
-		return types.NewJID(phone, types.DefaultUserServer)
+
+	if phone, found := resolveLIDForUser(mycli, jid.User); found {
+		realJID := types.NewJID(phone, types.DefaultUserServer)
+		log.Info().Str("phone", phone).Str("lid", jid.User).Msg("  ✅ LID resolvido")
+		return realJID
 	}
-	log.Warn().Str("userID", userID).Str("lid", jid.User).Msg("Could not resolve LID")
+
+	log.Warn().Str("lid", jid.User).Msg("  ⚠️  LID não resolvido, retornando original")
 	return types.NewJID(jid.User, types.DefaultUserServer)
 }
 
-func identifyChatType(userID string, chatJID types.JID, senderJID types.JID, senderAlt types.JID) (bool, types.JID, types.JID) {
-	log.Debug().Str("userID", userID).Str("chatJID", chatJID.String()).Str("senderJID", senderJID.String()).Str("senderAlt", senderAlt.String()).Msg("🔍 Identificando tipo de chat...")
-	
-	isGroup := chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer || strings.Contains(chatJID.Server, "broadcast")
-	
+// Identifica tipo de chat e resolve LIDs
+func identifyChatType(mycli *MyClient, chatJID types.JID, senderJID types.JID, senderAlt types.JID) (bool, types.JID, types.JID) {
+	log.Debug().
+		Str("userID", mycli.userID).
+		Str("chatJID", chatJID.String()).
+		Str("senderJID", senderJID.String()).
+		Str("senderAlt", senderAlt.String()).
+		Msg("🔍 Identificando tipo de chat...")
+
+	isGroup := chatJID.Server == types.GroupServer || 
+	           chatJID.Server == types.BroadcastServer || 
+	           strings.Contains(chatJID.Server, "broadcast")
+
 	if isGroup {
-		log.Debug().Str("chatJID", chatJID.String()).Msg("  👥 Chat identificado como GRUPO")
+		log.Debug().Str("chatJID", chatJID.String()).Msg("  👥 GRUPO detectado")
 		realChatJID := chatJID
 		senderReal, senderLID := getRealJID(senderJID, senderAlt)
+		
 		if isLID(senderLID) {
-			log.Info().Str("senderReal", senderReal.User).Str("senderLID", senderLID.User).Msg("  🆔 LID detectado em GRUPO - salvando...")
-			saveLIDForUser(userID, senderReal.User, senderLID.User)
+			log.Info().
+				Str("senderReal", senderReal.User).
+				Str("senderLID", senderLID.User).
+				Msg("  🆔 LID detectado em GRUPO - salvando...")
+			saveLIDForUser(mycli, senderReal.User, senderLID.User)
 		} else {
-			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não usa LID")
+			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não é LID")
 		}
+		
 		return true, realChatJID, senderReal
 	} else {
-		log.Debug().Str("chatJID", chatJID.String()).Msg("  👤 Chat identificado como INDIVIDUAL")
-		realChatJID := resolveRealJID(userID, chatJID, senderAlt)
+		log.Debug().Str("chatJID", chatJID.String()).Msg("  👤 CHAT INDIVIDUAL detectado")
+		realChatJID := resolveRealJID(mycli, chatJID, senderAlt)
 		senderReal, senderLID := getRealJID(senderJID, senderAlt)
+		
 		if isLID(senderLID) {
-			log.Info().Str("senderReal", senderReal.User).Str("senderLID", senderLID.User).Msg("  🆔 LID detectado em INDIVIDUAL - salvando...")
-			saveLIDForUser(userID, senderReal.User, senderLID.User)
+			log.Info().
+				Str("senderReal", senderReal.User).
+				Str("senderLID", senderLID.User).
+				Msg("  🆔 LID detectado em CHAT INDIVIDUAL - salvando...")
+			saveLIDForUser(mycli, senderReal.User, senderLID.User)
 		} else {
-			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não usa LID")
+			log.Debug().Str("senderReal", senderReal.User).Msg("  ✓ Sender não é LID")
 		}
-		log.Debug().Str("realChatJID", realChatJID.String()).Str("senderReal", senderReal.String()).Msg("  ✅ Chat identificado")
+		
+		log.Debug().
+			Str("realChatJID", realChatJID.String()).
+			Str("senderReal", senderReal.String()).
+			Msg("  ✅ Chat identificado e LIDs resolvidos")
+		
 		return false, realChatJID, senderReal
 	}
 }
+
+// ============================================================================
+// RESTO DO CÓDIGO CONTINUA IGUAL AO SEU ORIGINAL
+// ============================================================================
 
 func sendToGlobalWebHook(jsonData []byte, token string, userID string) {
 	jsonDataStr := string(jsonData)
@@ -245,7 +300,6 @@ func sendToGlobalWebHook(jsonData []byte, token string, userID string) {
 
 	if *globalWebhook != "" {
 		log.Info().Str("url", *globalWebhook).Msg("Calling global webhook")
-		// Add extra information for the global webhook
 		globalData := map[string]string{
 			"jsonData":     jsonDataStr,
 			"userID":       userID,
@@ -260,7 +314,6 @@ func sendToUserWebHook(webhookurl string, path string, jsonData []byte, userID s
 }
 
 func sendToUserWebHookWithHmac(webhookurl string, path string, jsonData []byte, userID string, token string, encryptedHmacKey []byte) {
-
 	instance_name := ""
 	userinfo, found := userinfocache.Get(token)
 	if found {
@@ -280,14 +333,12 @@ func sendToUserWebHookWithHmac(webhookurl string, path string, jsonData []byte, 
 		if path == "" {
 			go callHookWithHmac(webhookurl, data, userID, encryptedHmacKey)
 		} else {
-			// Create a channel to capture the error from the goroutine
 			errChan := make(chan error, 1)
 			go func() {
 				err := callHookFileWithHmac(webhookurl, data, userID, path, encryptedHmacKey)
 				errChan <- err
 			}()
 
-			// Optionally handle the error from the channel (if needed)
 			if err := <-errChan; err != nil {
 				log.Error().Err(err).Msg("Error calling hook file")
 			}
@@ -298,20 +349,17 @@ func sendToUserWebHookWithHmac(webhookurl string, path string, jsonData []byte, 
 }
 
 func updateAndGetUserSubscriptions(mycli *MyClient) ([]string, error) {
-	// Get updated events from cache/database
 	currentEvents := ""
 	userinfo2, found2 := userinfocache.Get(mycli.token)
 	if found2 {
 		currentEvents = userinfo2.(Values).Get("Events")
 	} else {
-		// If not in cache, get from database
 		if err := mycli.db.Get(&currentEvents, "SELECT events FROM users WHERE id=$1", mycli.userID); err != nil {
 			log.Warn().Err(err).Str("userID", mycli.userID).Msg("Could not get events from DB")
-			return nil, err // Propagate the error
+			return nil, err
 		}
 	}
 
-	// Update client subscriptions if changed
 	eventarray := strings.Split(currentEvents, ",")
 	var subscribedEvents []string
 	if len(eventarray) == 1 && eventarray[0] == "" {
@@ -325,9 +373,7 @@ func updateAndGetUserSubscriptions(mycli *MyClient) ([]string, error) {
 		}
 	}
 
-	// Update the client subscriptions
 	mycli.subscriptions = subscribedEvents
-
 	return subscribedEvents, nil
 }
 
@@ -345,7 +391,6 @@ func getUserWebhookUrl(token string) string {
 func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path string) {
 	webhookurl := getUserWebhookUrl(mycli.token)
 
-	// Get updated events from cache/database
 	subscribedEvents, err := updateAndGetUserSubscriptions(mycli)
 	if err != nil {
 		return
@@ -357,27 +402,23 @@ func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path 
 		return
 	}
 
-	// Log subscription details for debugging
 	log.Debug().
 		Str("userID", mycli.userID).
 		Str("eventType", eventType).
 		Strs("subscribedEvents", subscribedEvents).
 		Msg("Checking event subscription")
 
-	// Check if the current event is in the subscriptions
 	checkIfSubscribedInEvent := checkIfSubscribedToEvent(subscribedEvents, postmap["type"].(string), mycli.userID)
 	if !checkIfSubscribedInEvent {
 		return
 	}
 
-	// Prepare webhook data
 	jsonData, err := json.Marshal(postmap)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to marshal postmap to JSON")
 		return
 	}
 
-	// Get HMAC key for this user
 	var encryptedHmacKey []byte
 	if userinfo, found := userinfocache.Get(mycli.token); found {
 		encryptedB64 := userinfo.(Values).Get("HmacKeyEncrypted")
@@ -391,10 +432,7 @@ func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path 
 	}
 
 	sendToUserWebHookWithHmac(webhookurl, path, jsonData, mycli.userID, mycli.token, encryptedHmacKey)
-
-	// Get global webhook if configured
 	go sendToGlobalWebHook(jsonData, mycli.token, mycli.userID)
-
 	go sendToGlobalRabbit(jsonData, mycli.token, mycli.userID)
 }
 
@@ -410,7 +448,6 @@ func checkIfSubscribedToEvent(subscribedEvents []string, eventType string, userI
 	return true
 }
 
-// Connects to Whatsapp Websocket on server startup if last state was connected
 func (s *server) connectOnStartup() {
 	rows, err := s.db.Queryx("SELECT id,name,token,jid,webhook,events,proxy_url,CASE WHEN s3_enabled THEN 'true' ELSE 'false' END AS s3_enabled,media_delivery,COALESCE(history, 0) as history,hmac_key FROM users WHERE connected=1")
 	if err != nil {
@@ -455,7 +492,6 @@ func (s *server) connectOnStartup() {
 				"HmacKeyEncrypted": hmacKeyEncrypted,
 			}}
 			userinfocache.Set(token, v, cache.NoExpiration)
-			// Gets and set subscription to webhook events
 			eventarray := strings.Split(events, ",")
 
 			var subscribedEvents []string
@@ -478,7 +514,6 @@ func (s *server) connectOnStartup() {
 			killchannel[txtid] = make(chan bool)
 			go s.startClient(txtid, jid, token, subscribedEvents)
 
-			// Initialize S3 client if configured
 			go func(userID string) {
 				var s3Config struct {
 					Enabled       bool   `db:"s3_enabled"`
@@ -554,14 +589,12 @@ func parseJID(arg string) (types.JID, bool) {
 func (s *server) startClient(userID string, textjid string, token string, subscriptions []string) {
 	log.Info().Str("userid", userID).Str("jid", textjid).Msg("Starting websocket connection to Whatsapp")
 
-	// Connection retry constants
 	const maxConnectionRetries = 3
 	const connectionRetryBaseWait = 5 * time.Second
 
 	var deviceStore *store.Device
 	var err error
 
-	// First handle the device store initialization
 	if textjid != "" {
 		jid, _ := parseJID(textjid)
 		deviceStore, err = container.GetDevice(context.Background(), jid)
@@ -581,7 +614,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 
 	clientLog := waLog.Stdout("Client", *waDebug, *colorOutput)
 
-	// Create the client with initialized deviceStore
 	var client *whatsmeow.Client
 	if *waDebug != "" {
 		client = whatsmeow.NewClient(deviceStore, clientLog)
@@ -589,7 +621,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 		client = whatsmeow.NewClient(deviceStore, nil)
 	}
 
-	// Now we can use the client with the manager
 	clientManager.SetWhatsmeowClient(userID, client)
 
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_UNKNOWN.Enum()
@@ -598,8 +629,10 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	mycli := MyClient{client, 1, userID, token, subscriptions, s.db, s}
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
-	// Store the MyClient in clientManager
 	clientManager.SetMyClient(userID, &mycli)
+
+	// ✅ CARREGAR LIDs DO BANCO NA INICIALIZAÇÃO
+	loadLIDsForUser(&mycli)
 
 	httpClient := resty.New()
 	httpClient.SetRedirectPolicy(resty.FlexibleRedirectPolicy(15))
@@ -610,14 +643,11 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	httpClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
 	httpClient.OnError(func(req *resty.Request, err error) {
 		if v, ok := err.(*resty.ResponseError); ok {
-			// v.Response contains the last response from the server
-			// v.Err contains the original error
 			log.Debug().Str("response", v.Response.String()).Msg("resty error")
 			log.Error().Err(v.Err).Msg("resty error")
 		}
 	})
 
-	// Set proxy if defined in DB (assumes users table contains proxy_url column)
 	var proxyURL string
 	err = s.db.Get(&proxyURL, "SELECT proxy_url FROM users WHERE id=$1", userID)
 	if err == nil && proxyURL != "" {
@@ -625,13 +655,12 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 		if perr != nil {
 			log.Warn().Err(perr).Str("proxy", proxyURL).Msg("Invalid proxy URL, skipping proxy setup")
 		} else {
-
 			log.Info().Str("proxy", proxyURL).Msg("Configuring proxy")
 
 			if parsed.Scheme == "socks5" || parsed.Scheme == "socks5h" {
 				dialer, derr := proxy.FromURL(parsed, nil)
 				if derr != nil {
-					log.Warn().Err(derr).Str("proxy", proxyURL).Msg("Failed to build SOCKS proxy dialer, skipping proxy setup")
+					log.Warn().Err(derr).Str("proxy", proxyURL).Msg("Failed to build SOCKS proxy dialer")
 				} else {
 					httpClient.SetProxy(proxyURL)
 					client.SetSOCKSProxy(dialer, whatsmeow.SetProxyOptions{})
@@ -647,16 +676,14 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	clientManager.SetHTTPClient(userID, httpClient)
 
 	if client.Store.ID == nil {
-		// No ID stored, new login
 		qrChan, err := client.GetQRChannel(context.Background())
 		if err != nil {
-			// This error means that we're already logged in, so ignore it.
 			if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
 				log.Error().Err(err).Msg("Failed to get QR channel")
 				return
 			}
 		} else {
-			err = client.Connect() // Must connect to generate QR code
+			err = client.Connect()
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to connect client")
 				return
@@ -666,12 +693,10 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 
 			for evt := range qrChan {
 				if evt.Event == "code" {
-					// Display QR code in terminal (useful for testing/developing)
 					if *logType != "json" {
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 						fmt.Println("QR code:\n", evt.Code)
 					}
-					// Store encoded/embeded base64 QR on database for retrieval with the /qr endpoint
 					image, _ := qrcode.Encode(evt.Code, qrcode.Medium, 256)
 					base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
 					sqlStmt := `UPDATE users SET qrcode=$1 WHERE id=$2`
@@ -686,7 +711,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 						}
 					}
 
-					//send QR code with webhook
 					postmap := make(map[string]interface{})
 					postmap["event"] = evt.Event
 					postmap["qrCodeBase64"] = base64qrcode
@@ -695,8 +719,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 					sendEventWithWebHook(&mycli, postmap, "")
 
 				} else if evt.Event == "timeout" {
-					// Clear QR code from DB on timeout
-					// Send webhook notifying QR timeout before cleanup
 					postmap := make(map[string]interface{})
 					postmap["event"] = evt.Event
 					postmap["type"] = "QRTimeout"
@@ -719,7 +741,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 					killchannel[userID] <- true
 				} else if evt.Event == "success" {
 					log.Info().Msg("QR pairing ok!")
-					// Clear QR code after pairing
 					sqlStmt := `UPDATE users SET qrcode='', connected=1 WHERE id=$1`
 					_, err := s.db.Exec(sqlStmt, userID)
 					if err != nil {
@@ -737,10 +758,8 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 		}
 
 	} else {
-		// Already logged in, just connect
 		log.Info().Msg("Already logged in, just connect")
 
-		// Retry logic with linear backoff
 		var lastErr error
 
 		for attempt := 0; attempt < maxConnectionRetries; attempt++ {
@@ -787,7 +806,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 				log.Error().Err(dbErr).Msg("Failed to update user status after connection error")
 			}
 
-			// Use the existing mycli instance from outer scope
 			postmap := make(map[string]interface{})
 			postmap["event"] = "ConnectFailure"
 			postmap["error"] = lastErr.Error()
@@ -800,7 +818,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 		}
 	}
 
-	// Keep connected client live until disconnected/killed
 	for {
 		select {
 		case <-killchannel[userID]:
@@ -817,7 +834,6 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
-			//log.Info().Str("jid",textjid).Msg("Loop the loop")
 		}
 	}
 }
@@ -838,10 +854,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	dowebhook := 0
 	path := ""
 
-	if _, exists := userLIDMaps[mycli.userID]; !exists {
-		loadLIDsForUser(mycli.userID)
-	}
-
 	switch evt := rawEvt.(type) {
 	case *events.AppStateSyncComplete:
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
@@ -858,8 +870,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if len(mycli.WAClient.Store.PushName) == 0 {
 			break
 		}
-		// Send presence available when connecting and when the pushname is changed.
-		// This makes sure that outgoing messages always have the right pushname.
 		err := mycli.WAClient.SendPresence(context.Background(), types.PresenceAvailable)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to send available presence")
@@ -907,7 +917,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if !found {
 			err := mycli.db.Get(&s3Config, "SELECT CASE WHEN s3_enabled = 1 THEN 'true' ELSE 'false' END AS s3_enabled, media_delivery FROM users WHERE id = $1", txtid)
 			if err != nil {
-				log.Error().Err(err).Msg("onMessage Failed to get S3 config from DB as it was not on cache")
+				log.Error().Err(err).Msg("onMessage Failed to get S3 config from DB")
 				s3Config.Enabled = "false"
 				s3Config.MediaDelivery = "base64"
 			}
@@ -928,17 +938,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if evt.IsViewOnce {
 			metaParts = append(metaParts, "view once")
 		}
-		if evt.IsViewOnce {
+		if evt.IsEphemeral {
 			metaParts = append(metaParts, "ephemeral")
 		}
 
 		log.Info().Str("id", evt.Info.ID).Str("source", evt.Info.SourceString()).Str("parts", strings.Join(metaParts, ", ")).Msg("Message Received")
 
 		if !*skipMedia {
-			// try to get Image if any
 			img := evt.Message.GetImageMessage()
 			if img != nil {
-				// Create a temporary directory in /tmp
 				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0751)
 				if errDir != nil {
@@ -946,34 +954,29 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// Download the image
 				data, err := mycli.WAClient.Download(context.Background(), img)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to download image")
 					return
 				}
 
-				// Determine the file extension based on the MIME type
 				exts, _ := mime.ExtensionsByType(img.GetMimetype())
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+exts[0])
 
-				// Write the image to the temporary file
 				err = os.WriteFile(tmpPath, data, 0600)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save image to temporary file")
 					return
 				}
 
-				// Process S3 upload if enabled
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+					contactJID := realSenderJID.String()
 					if isGroup {
 						contactJID = realChatJID.String()
 					}
 
-					// Process S3 upload
 					s3Data, err := GetS3Manager().ProcessMediaForS3(
 						context.Background(),
 						txtid,
@@ -991,7 +994,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 
-				// Convert the image to base64 if needed
 				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
 					base64String, mimeType, err := fileToBase64(tmpPath)
 					if err != nil {
@@ -999,16 +1001,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						return
 					}
 
-					// Add the base64 string and other details to the postmap
 					postmap["base64"] = base64String
 					postmap["mimeType"] = mimeType
 					postmap["fileName"] = filepath.Base(tmpPath)
 				}
 
-				// Log the successful conversion
 				log.Info().Str("path", tmpPath).Msg("Image processed")
 
-				// Delete the temporary file
 				err = os.Remove(tmpPath)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to delete temporary file")
@@ -1017,10 +1016,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 
-			// try to get Audio if any
 			audio := evt.Message.GetAudioMessage()
 			if audio != nil {
-				// Create a temporary directory in /tmp
 				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0751)
 				if errDir != nil {
@@ -1028,40 +1025,35 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// Download the audio
 				data, err := mycli.WAClient.Download(context.Background(), audio)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to download audio")
 					return
 				}
 
-				// Determine the file extension based on the MIME type
 				exts, _ := mime.ExtensionsByType(audio.GetMimetype())
 				var ext string
 				if len(exts) > 0 {
 					ext = exts[0]
 				} else {
-					ext = ".ogg" // Default extension if MIME type is not recognized
+					ext = ".ogg"
 				}
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+ext)
 
-				// Write the audio to the temporary file
 				err = os.WriteFile(tmpPath, data, 0600)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save audio to temporary file")
 					return
 				}
 
-				// Process S3 upload if enabled
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+					contactJID := realSenderJID.String()
 					if isGroup {
 						contactJID = realChatJID.String()
 					}
 
-					// Process S3 upload
 					s3Data, err := GetS3Manager().ProcessMediaForS3(
 						context.Background(),
 						txtid,
@@ -1079,7 +1071,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 
-				// Convert the audio to base64 if needed
 				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
 					base64String, mimeType, err := fileToBase64(tmpPath)
 					if err != nil {
@@ -1087,16 +1078,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						return
 					}
 
-					// Add the base64 string and other details to the postmap
 					postmap["base64"] = base64String
 					postmap["mimeType"] = mimeType
 					postmap["fileName"] = filepath.Base(tmpPath)
 				}
 
-				// Log the successful conversion
 				log.Info().Str("path", tmpPath).Msg("Audio processed")
 
-				// Delete the temporary file
 				err = os.Remove(tmpPath)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to delete temporary file")
@@ -1105,10 +1093,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 
-			// try to get Document if any
 			document := evt.Message.GetDocumentMessage()
 			if document != nil {
-				// Create a temporary directory in /tmp
 				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0751)
 				if errDir != nil {
@@ -1116,14 +1102,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// Download the document
 				data, err := mycli.WAClient.Download(context.Background(), document)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to download document")
 					return
 				}
 
-				// Determine the file extension
 				extension := ""
 				exts, err := mime.ExtensionsByType(document.GetMimetype())
 				if err == nil && len(exts) > 0 {
@@ -1133,28 +1117,25 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					if filename != nil {
 						extension = filepath.Ext(*filename)
 					} else {
-						extension = ".bin" // Default extension if no filename or MIME type is available
+						extension = ".bin"
 					}
 				}
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+extension)
 
-				// Write the document to the temporary file
 				err = os.WriteFile(tmpPath, data, 0600)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save document to temporary file")
 					return
 				}
 
-				// Process S3 upload if enabled
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+					contactJID := realSenderJID.String()
 					if isGroup {
 						contactJID = realChatJID.String()
 					}
 
-					// Process S3 upload
 					s3Data, err := GetS3Manager().ProcessMediaForS3(
 						context.Background(),
 						txtid,
@@ -1172,7 +1153,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 
-				// Convert the document to base64 if needed
 				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
 					base64String, mimeType, err := fileToBase64(tmpPath)
 					if err != nil {
@@ -1180,16 +1160,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						return
 					}
 
-					// Add the base64 string and other details to the postmap
 					postmap["base64"] = base64String
 					postmap["mimeType"] = mimeType
 					postmap["fileName"] = filepath.Base(tmpPath)
 				}
 
-				// Log the successful conversion
 				log.Info().Str("path", tmpPath).Msg("Document processed")
 
-				// Delete the temporary file
 				err = os.Remove(tmpPath)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to delete temporary file")
@@ -1198,10 +1175,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 
-			// try to get Video if any
 			video := evt.Message.GetVideoMessage()
 			if video != nil {
-				// Create a temporary directory in /tmp
 				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0751)
 				if errDir != nil {
@@ -1209,34 +1184,29 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// Download the video
 				data, err := mycli.WAClient.Download(context.Background(), video)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to download video")
 					return
 				}
 
-				// Determine the file extension based on the MIME type
 				exts, _ := mime.ExtensionsByType(video.GetMimetype())
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+exts[0])
 
-				// Write the video to the temporary file
 				err = os.WriteFile(tmpPath, data, 0600)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save video to temporary file")
 					return
 				}
 
-				// Process S3 upload if enabled
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-					// Get sender JID for inbox/outbox determination
 					isIncoming := evt.Info.IsFromMe == false
-					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+					contactJID := realSenderJID.String()
 					if isGroup {
 						contactJID = realChatJID.String()
 					}
 
-					// Process S3 upload
 					s3Data, err := GetS3Manager().ProcessMediaForS3(
 						context.Background(),
 						txtid,
@@ -1254,7 +1224,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 
-				// Convert the video to base64 if needed
 				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
 					base64String, mimeType, err := fileToBase64(tmpPath)
 					if err != nil {
@@ -1262,16 +1231,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						return
 					}
 
-					// Add the base64 string and other details to the postmap
 					postmap["base64"] = base64String
 					postmap["mimeType"] = mimeType
 					postmap["fileName"] = filepath.Base(tmpPath)
 				}
 
-				// Log the successful conversion
 				log.Info().Str("path", tmpPath).Msg("Video processed")
 
-				// Delete the temporary file
 				err = os.Remove(tmpPath)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to delete temporary file")
@@ -1289,14 +1255,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// download the sticker using the DownloadableMessage interface
 				data, err := mycli.WAClient.Download(context.Background(), sticker)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to download sticker")
 					return
 				}
 
-				// tries to infer extension by mimetype; fallback to .webp
 				exts, _ := mime.ExtensionsByType(sticker.GetMimetype())
 				ext := ".webp"
 				if len(exts) > 0 && exts[0] != "" {
@@ -1309,10 +1273,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					return
 				}
 
-				// if using S3 (same stream as other media)
 				if s3Config.Enabled == "true" && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
 					isIncoming := evt.Info.IsFromMe == false
-					isGroup, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt); contactJID := realSenderJID.String()
+					isGroup, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
+					contactJID := realSenderJID.String()
 					if isGroup {
 						contactJID = realChatJID.String()
 					}
@@ -1333,7 +1297,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 
-				// base64 (same output contract as other media)
 				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
 					base64String, mimeType, err := fileToBase64(tmpPath)
 					if err != nil {
@@ -1345,7 +1308,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					postmap["fileName"] = filepath.Base(tmpPath)
 				}
 
-				// useful metadata (optional, but handy)
 				postmap["isSticker"] = true
 				postmap["stickerAnimated"] = sticker.GetIsAnimated()
 
@@ -1356,8 +1318,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		}
 
-		// Save message to history regardless of skipMedia setting
-		// Get user's history setting from cache
 		var historyLimit int
 		userinfo, found := userinfocache.Get(mycli.token)
 		if found {
@@ -1375,18 +1335,16 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			caption := ""
 			replyToMessageID := ""
 
-			// Check for delete messages first
 			if protocolMsg := evt.Message.GetProtocolMessage(); protocolMsg != nil && protocolMsg.GetType() == 0 {
 				messageType = "delete"
 				if protocolMsg.GetKey() != nil {
-					textContent = protocolMsg.GetKey().GetID() // Store the deleted message ID
+					textContent = protocolMsg.GetKey().GetID()
 				}
 				log.Info().Str("deletedMessageID", textContent).Str("messageID", evt.Info.ID).Msg("Delete message detected")
-				// Check for reactions
 			} else if reaction := evt.Message.GetReactionMessage(); reaction != nil {
 				messageType = "reaction"
 				replyToMessageID = reaction.GetKey().GetID()
-				textContent = reaction.GetText() // This will be the emoji
+				textContent = reaction.GetText()
 			} else if img := evt.Message.GetImageMessage(); img != nil {
 				messageType = "image"
 				caption = img.GetCaption()
@@ -1408,13 +1366,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				textContent = location.GetName()
 			}
 
-			// Extract text content for non-reaction and non-delete messages
 			if messageType != "reaction" && messageType != "delete" {
 				if conv := evt.Message.GetConversation(); conv != "" {
 					textContent = conv
 				} else if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
 					textContent = ext.GetText()
-					// Check if this is a reply to another message
 					if contextInfo := ext.GetContextInfo(); contextInfo != nil && contextInfo.GetStanzaId() != "" {
 						replyToMessageID = contextInfo.GetStanzaId()
 					}
@@ -1422,7 +1378,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					textContent = caption
 				}
 
-				// Set default text content for media messages without captions
 				if textContent == "" {
 					switch messageType {
 					case "image":
@@ -1447,27 +1402,14 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 
-			// Check for replies in regular conversation messages too
-			if messageType == "text" && replyToMessageID == "" {
-				// For regular text messages, check if there's context info indicating a reply
-				// This might be available in the message context
-				if conv := evt.Message.GetConversation(); conv != "" {
-					// Check if the message has reply context (this depends on WhatsApp message structure)
-					// For now, we'll rely on ExtendedTextMessage for reply detection
-				}
-			}
-
-			// Try to get media link from S3 data if available
 			if s3Data, ok := postmap["s3"].(map[string]interface{}); ok {
 				if url, ok := s3Data["url"].(string); ok {
 					mediaLink = url
 				}
 			}
 
-			// Only save if there's meaningful content (including delete messages)
 			if textContent != "" || mediaLink != "" || (messageType != "text" && messageType != "reaction") || messageType == "delete" {
-				_, realChatJID, realSenderJID := identifyChatType(mycli.userID, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
-				// Serializar evt para JSON
+				_, realChatJID, realSenderJID := identifyChatType(mycli, evt.Info.Chat, evt.Info.Sender, evt.Info.SenderAlt)
 				evtJSON, err := json.Marshal(evt)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to marshal event to JSON")
@@ -1504,21 +1446,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if isLID(evt.Chat) {
 			log.Debug().Str("userID", mycli.userID).Str("lid", evt.Chat.User).Msg("LID detected in receipt")
 		}
-		//if evt.Type == events.ReceiptTypeRead || evt.Type == events.ReceiptTypeReadSelf {
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
 			log.Info().Strs("id", evt.MessageIDs).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message was read")
-			//if evt.Type == events.ReceiptTypeRead {
 			if evt.Type == types.ReceiptTypeRead {
 				postmap["state"] = "Read"
 			} else {
 				postmap["state"] = "ReadSelf"
 			}
-			//} else if evt.Type == events.ReceiptTypeDelivered {
 		} else if evt.Type == types.ReceiptTypeDelivered {
 			postmap["state"] = "Delivered"
 			log.Info().Str("id", evt.MessageIDs[0]).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message delivered")
 		} else {
-			// Discard webhooks for inactive or other delivery types
 			return
 		}
 	case *events.Presence:
@@ -1545,7 +1483,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		dowebhook = 1
 		log.Info().Str("reason", evt.Reason.String()).Msg("Logged out")
 		defer func() {
-			// Use a non-blocking send to prevent a deadlock if the receiver has already terminated.
 			select {
 			case killchannel[mycli.userID] <- true:
 			default:
