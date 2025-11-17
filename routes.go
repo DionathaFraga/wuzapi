@@ -115,6 +115,17 @@ func (s *server) routes() {
 	s.router.Handle("/chat/send/poll", c.Then(s.SendPoll())).Methods("POST")
 	s.router.Handle("/chat/send/edit", c.Then(s.SendEditMessage())).Methods("POST")
 	s.router.Handle("/chat/history", c.Then(s.GetHistory())).Methods("GET")
+	s.router.Handle("/chat/request-unavailable-message", c.Then(s.RequestUnavailableMessage())).Methods("POST")
+	s.router.Handle("/chat/archive", c.Then(s.ArchiveChat())).Methods("POST")
+
+	// ============================================================================
+	// NOVAS ROTAS: Botões e Listas Interativas Modernas (Native Flow)
+	// ============================================================================
+	s.router.Handle("/chat/send/interactive-buttons", c.Then(s.SendInteractiveButtons())).Methods("POST")
+	s.router.Handle("/chat/send/link-button", c.Then(s.SendLinkButton())).Methods("POST")
+	s.router.Handle("/chat/send/interactive-list", c.Then(s.SendInteractiveList())).Methods("POST")
+	s.router.Handle("/chat/send/copy-button", c.Then(s.SendCopyButton())).Methods("POST")
+	s.router.Handle("/chat/send/call-button", c.Then(s.SendCallButton())).Methods("POST")
 
 	s.router.Handle("/status/set/text", c.Then(s.SetStatusMessage())).Methods("POST")
 
